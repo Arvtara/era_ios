@@ -1,20 +1,16 @@
 # ============================================================
 # uEmuera iOS 云端构建（GitHub Actions）
 #
-# 路线：仓库只放 Unity 源工程（约 50MB），云端 runner 现场：
+# 路线：仓库只放 Unity 源工程，云端 runner 现场：
 #         1. 用 Unity 2019.4.40f1c1 导出 Xcode 工程
 #         2. 用 Xcode 14.2 无签名编译
 #         3. 注入 TrollStore entitlements
 #         4. 打包 .tipa
 #
-# 放置位置：仓库根目录 .github/workflows/build-ios.yml
-#
-# 关键点：
-#   - 不要把 Unity 导出的 Xcode 工程（875MB）提交进仓库，
-#     它包含 libiPhone-lib.a (597MB) / libil2cpp.a (113MB)，
-#     超过 GitHub 100MB 单文件硬限制。这些文件由第 1 步现场生成。
-#   - GameCI 的 unity-builder 在中国的下载速度可能较慢；
-#     若超时，改用自建 macOS 机或团结云构建（见 README-iOS.md）。
+# 性能说明（重要）：
+#   首次构建需下载 Unity 编辑器 2-3GB，耗时 40-70 分钟属正常。
+#   本 workflow 已缓存 Unity 编辑器与 Library，第二次起约 15-25 分钟。
+#   不要因为"看起来没动"而取消——下载阶段日志不会刷新。
 # ============================================================
 
 name: Build iOS tipa
@@ -22,48 +18,64 @@ name: Build iOS tipa
 on:
   push:
     branches: [main, master]
-    paths-ignore:            # 只改文档不必触发重编译
+    paths-ignore:
       - '**.md'
       - 'LICENSE'
-  workflow_dispatch:         # 支持网页手动触发
+  workflow_dispatch:
 
 jobs:
   # ---------- 阶段一：Unity 导出 Xcode 工程 ----------
   export:
     name: Unity export Xcode project
     runs-on: macos-13
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: false
 
+      # ---- 缓存 1：Unity 编辑器本体（省掉 30 分钟下载的关键）----
+      - name: Cache Unity Editor
+        id: cache-unity
+        uses: actions/cache@v4
+        with:
+          path: /Applications/Unity/Hub/Editor
+          key: UnityEditor-mac-2019.4.40f1c1
+
+      # ---- 缓存 2：Unity 导入缓存（加速脚本编译）----
       - name: Cache Unity Library
         uses: actions/cache@v4
         with:
-          path: Library
-          key: Unity-${{ runner.os }}-${{ hashFiles('ProjectSettings/ProjectVersion.txt','Packages/manifest.json') }}
-          restore-keys: Unity-${{ runner.os }}-
+          path: |
+            Library
+            ~/Library/Unity/cache
+          key: UnityLib-${{ runner.os }}-${{ hashFiles('ProjectSettings/ProjectVersion.txt','Packages/manifest.json') }}
+          restore-keys: UnityLib-${{ runner.os }}-
 
+      - name: Notice
+        run: |
+          echo "::notice::开始 Unity 导出。首次需下载约 2-3GB Unity 编辑器，"
+          echo "::notice::该阶段可持续 30-60 分钟且日志不刷新，属正常现象，请勿取消。"
+
+      # ---- Unity 导出 ----
       - name: Unity Build (export iOS)
         uses: game-ci/unity-builder@v4
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL:   ${{ secrets.UNITY_EMAIL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
           targetPlatform: iOS
           unityVersion: 2019.4.40f1c1
-          # 只导出工程，不做 Xcode 编译（编译交给下一阶段，便于控制 SDK/Xcode 版本）
           buildMethod: UEmueraBuilder.TuanjieCloudBuild.BuildProject
-          customParameters: -quit -batchmode -nographics
 
       - name: Locate exported Xcode project
         id: locate
         run: |
           echo "--- 导出目录扫描 ---"
-          find . -maxdepth 3 -name "*.xcodeproj" -o -maxdepth 3 -name "*.xcworkspace" | head -20
-          PROJ=$(find . -maxdepth 4 -name "Unity-iPhone.xcodeproj" | head -n 1)
+          find . -maxdepth 4 -name "Unity-iPhone.xcodeproj" -o -maxdepth 4 -name "Unity-iPhone.xcworkspace" | head -20
+          PROJ=$(find . -maxdepth 5 -name "Unity-iPhone.xcodeproj" | head -n 1)
           if [ -z "$PROJ" ]; then
             echo "::error::没找到 Unity-iPhone.xcodeproj，Unity 导出可能失败。"
             ls -la
@@ -72,6 +84,7 @@ jobs:
           DIR=$(dirname "$PROJ")
           echo "PROJ_DIR=$DIR" >> $GITHUB_ENV
           echo "导出目录: $DIR"
+          du -sh "$DIR" || true
 
       - name: Upload Xcode project as artifact
         uses: actions/upload-artifact@v4
@@ -79,12 +92,14 @@ jobs:
           name: xcode-project
           path: ${{ env.PROJ_DIR }}
           retention-days: 3
+          compression-level: 0
 
   # ---------- 阶段二：编译 + 打包 tipa ----------
   build:
     name: Build unsigned tipa
     needs: export
     runs-on: macos-13
+    timeout-minutes: 90
     steps:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
@@ -113,7 +128,6 @@ jobs:
           </dict>
           </plist>
           EOF
-          echo "entitlements 已生成："
           cat ci/entitlements.plist
 
       - name: Build (no code signing)
@@ -130,13 +144,13 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             -derivedDataPath build \
-            | tee build.log | tail -120
+            | tee build.log | tail -150
 
       - name: Assemble Payload
         run: |
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
-            echo "::error::没找到 .app 产物，构建可能失败，请查看 build-log。"
+            echo "::error::没找到 .app 产物，请查看 build-log artifact。"
             exit 1
           fi
           APP_NAME=$(basename "$APP_PATH" .app)
