@@ -1,0 +1,65 @@
+# ============================================================
+# uEmuera — 团结引擎云构建工作流配置
+#
+# 放置位置：项目根目录的 .workflows/ 文件夹下
+#   <项目根>/.workflows/build-ios.yaml
+#
+# 工作流语法遵循 GitHub Actions 扩展规范
+# 参考: https://devops.unity.cn/help/docs/advanced/yaml
+#
+# 产物：iOS 的 Xcode 工程（云上不做签名）
+#   下载后需在 macOS 上用 iOS/build_ipa.sh 进行：
+#   xcodebuild 无签名构建 -> ldid 注入 TrollStore entitlements -> 打包 tipa
+# ============================================================
+
+name: uEmuera iOS Build
+
+# 推送到仓库时触发；也可在团结云开发 App 中手动“开始构建”
+# 注：on 加引号是为了避免 YAML 1.1 把它解析成布尔值
+"on": [push]
+
+jobs:
+  build:
+    name: Build iOS (Xcode Project)
+
+    # 云打包机标签。**必须按“云构建服务器”文档选择与团结版本匹配的镜像**
+    # 参考: https://devops.unity.cn/help/docs/reference/config
+    # macOS 镜像用于 iOS 构建；标签中的版本号需与工程使用的团结引擎版本一致
+    # 注意：下方为示例标签，请以官方文档当前可用列表为准
+    runs-on: macos-tuanjie-1.1.0-8c-16g
+
+    steps:
+      # ---------- 1. 检出项目 ----------
+      - name: Check out project repository
+        uses: actions/checkout-plasticscm@v1
+        with:
+          path: uemuera
+
+      - name: List repository content
+        run: ls -l ./uemuera
+
+      # ---------- 2. 构建 iOS（导出 Xcode 工程） ----------
+      # buildMethod 指向 Assets/Editor/TuanjieCloudBuild.cs 中的静态方法
+      - name: Build iOS project
+        uses: actions/tj-builder@v3
+        id: build-action
+        with:
+          targetPlatform: iOS
+          projectPath: ./uemuera
+          buildMethod: UEmueraBuilder.TuanjieCloudBuild.BuildProject
+          # iOS 上不做签名：云端仅导出 Xcode 工程，签名/打包落地本地完成
+          # （团结云构建不提供自定义 post-build 脚本执行能力，
+          #   而 TrollStore 的 ldid 注入必须在产出后手动执行）
+          buildsPath: ./uemuera/CloudBuild
+          customParameters: -buildsPath ./uemuera/CloudBuild -projectPath ./uemuera
+
+      # ---------- 3. 校验产物 ----------
+      - name: Check build result
+        run: ls -l ${{ steps.build-action.outputs.buildsPath }}
+
+      # ---------- 4. 上传制品（构建记录里可下载） ----------
+      - name: Upload artifact
+        uses: actions/tj-upload-artifact@v2
+        with:
+          name: uEmuera-iOS-${{ steps.build-action.outputs.buildVersion }}
+          path: ${{ steps.build-action.outputs.buildsPath }}

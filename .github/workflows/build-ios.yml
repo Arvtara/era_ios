@@ -1,0 +1,174 @@
+# ============================================================
+# uEmuera iOS 云端构建（GitHub Actions）
+#
+# 路线：仓库只放 Unity 源工程（约 50MB），云端 runner 现场：
+#         1. 用 Unity 2019.4.40f1c1 导出 Xcode 工程
+#         2. 用 Xcode 14.2 无签名编译
+#         3. 注入 TrollStore entitlements
+#         4. 打包 .tipa
+#
+# 放置位置：仓库根目录 .github/workflows/build-ios.yml
+#
+# 关键点：
+#   - 不要把 Unity 导出的 Xcode 工程（875MB）提交进仓库，
+#     它包含 libiPhone-lib.a (597MB) / libil2cpp.a (113MB)，
+#     超过 GitHub 100MB 单文件硬限制。这些文件由第 1 步现场生成。
+#   - GameCI 的 unity-builder 在中国的下载速度可能较慢；
+#     若超时，改用自建 macOS 机或团结云构建（见 README-iOS.md）。
+# ============================================================
+
+name: Build iOS tipa
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:            # 只改文档不必触发重编译
+      - '**.md'
+      - 'LICENSE'
+  workflow_dispatch:         # 支持网页手动触发
+
+jobs:
+  # ---------- 阶段一：Unity 导出 Xcode 工程 ----------
+  export:
+    name: Unity export Xcode project
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Cache Unity Library
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Unity-${{ runner.os }}-${{ hashFiles('ProjectSettings/ProjectVersion.txt','Packages/manifest.json') }}
+          restore-keys: Unity-${{ runner.os }}-
+
+      - name: Unity Build (export iOS)
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL:   ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: iOS
+          unityVersion: 2019.4.40f1c1
+          # 只导出工程，不做 Xcode 编译（编译交给下一阶段，便于控制 SDK/Xcode 版本）
+          buildMethod: UEmueraBuilder.TuanjieCloudBuild.BuildProject
+          customParameters: -quit -batchmode -nographics
+
+      - name: Locate exported Xcode project
+        id: locate
+        run: |
+          echo "--- 导出目录扫描 ---"
+          find . -maxdepth 3 -name "*.xcodeproj" -o -maxdepth 3 -name "*.xcworkspace" | head -20
+          PROJ=$(find . -maxdepth 4 -name "Unity-iPhone.xcodeproj" | head -n 1)
+          if [ -z "$PROJ" ]; then
+            echo "::error::没找到 Unity-iPhone.xcodeproj，Unity 导出可能失败。"
+            ls -la
+            exit 1
+          fi
+          DIR=$(dirname "$PROJ")
+          echo "PROJ_DIR=$DIR" >> $GITHUB_ENV
+          echo "导出目录: $DIR"
+
+      - name: Upload Xcode project as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-project
+          path: ${{ env.PROJ_DIR }}
+          retention-days: 3
+
+  # ---------- 阶段二：编译 + 打包 tipa ----------
+  build:
+    name: Build unsigned tipa
+    needs: export
+    runs-on: macos-13
+    steps:
+      - name: Download Xcode project
+        uses: actions/download-artifact@v4
+        with:
+          name: xcode-project
+
+      - name: Select Xcode 14.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_14.2.app
+          xcodebuild -version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Prepare entitlements
+        run: |
+          mkdir -p ci
+          cat > ci/entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.private.security.no-sandbox</key><true/>
+            <key>platform-application</key><true/>
+            <key>get-task-allow</key><true/>
+          </dict>
+          </plist>
+          EOF
+          echo "entitlements 已生成："
+          cat ci/entitlements.plist
+
+      - name: Build (no code signing)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            -derivedDataPath build \
+            | tee build.log | tail -120
+
+      - name: Assemble Payload
+        run: |
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::没找到 .app 产物，构建可能失败，请查看 build-log。"
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH" .app)
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          echo "产物: $APP_PATH"
+
+      - name: Inject TrollStore entitlements
+        run: |
+          ldid -Sci/entitlements.plist "dist/Payload/$APP_NAME/$APP_NAME"
+          echo "已注入 no-sandbox + platform-application"
+          ldid -e "dist/Payload/$APP_NAME/$APP_NAME" || true
+
+      - name: Package tipa
+        run: |
+          cd dist
+          zip -qry "$APP_NAME.tipa" Payload
+          rm -rf Payload
+          ls -lh *.tipa
+
+      - name: Upload tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: uEmuera-tipa
+          path: dist/*.tipa
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7

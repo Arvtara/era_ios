@@ -1,0 +1,31 @@
+# ---- Unity 导出工程：不参与构建的中间产物 ----
+build/
+*.log
+build.log
+DerivedData/
+dist/
+
+# ---- macOS / Xcode ----
+.DS_Store
+*.xcuserdatad/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+
+# ---- Unity 相关（若工程根含 Unity 目录）----
+Library/
+Temp/
+obj/
+*.csproj
+*.sln
+*.user
+
+# 注意：不要忽略以下内容，它们是构建必需的
+# !Classes/
+# !Libraries/
+# !Data/
+# !UnityFramework.framework/
+# !Unity-iPhone.xcodeproj/
+# !Unity-iPhone.xcworkspace/
+# !main.mm / !Info.plist / !*.plist

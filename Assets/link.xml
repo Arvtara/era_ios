@@ -1,0 +1,6 @@
+<linker>
+  <!-- iOS IL2CPP managed stripping 保护：zip 游戏包导入依赖 -->
+  <assembly fullname="System.IO.Compression" preserve="all"/>
+  <assembly fullname="System.IO.Compression.ZipFile" preserve="all"/>
+  <assembly fullname="System.IO.Compression.FileSystem" preserve="all"/>
+</linker>

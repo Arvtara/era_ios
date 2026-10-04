@@ -1,0 +1,61 @@
+# ============================================================
+# uEmuera iOS —— .gitignore
+# 放到 Unity 工程根目录，命名 .gitignore
+# ============================================================
+
+# ---- Unity 工程本体（不必提交）----
+Library/
+Temp/
+Obj/
+obj/
+Logs/
+UserSettings/
+*.csproj
+*.sln
+*.user
+*.unityproj
+*.pidb
+*.booproj
+*.svd
+crashlytics-build.properties
+
+# ---- ★ 关键：Unity 导出的 Xcode 工程里的大文件 ★ ----
+# 这两个是 IL2CPP/Runtime 静态库，Xcode 构建时会自动重新生成，
+# 单个 113MB / 597MB，远超 GitHub 100MB 硬限制，必须排除。
+Libraries/
+*.a
+*.dylib
+*.so
+
+# ---- 构建产物 ----
+build/
+DerivedData/
+dist/
+Payload/
+*.tipa
+*.ipa
+*.app
+*.log
+build.log
+
+# ---- macOS / Xcode ----
+.DS_Store
+xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+
+# ---- 临时文件 ----
+*.tmp
+*.bak
+*~
+
+# ============================================================
+# 注意：以下内容是构建必需的，切勿加入忽视列表
+#   Classes/            Unity 与 Objective-C 集成代码
+#   Data/               资源与托管程序集
+#   UnityFramework.framework/
+#   Unity-iPhone.xcodeproj/  （若走"提交完整 Xcode 工程"路线）
+#   Info.plist / main.mm
+# ============================================================
