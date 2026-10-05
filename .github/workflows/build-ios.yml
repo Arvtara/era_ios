@@ -392,9 +392,16 @@ jobs:
       - name: Package tipa
         run: |
           cd dist
-          # Payload 下的 .app 目录名带后缀，tipa 文件名用 APP_NAME 即可
-          [ -d "$APP_BUNDLE" ] || { echo "::error::Payload 中缺少 $APP_BUNDLE"; ls -la; exit 1; }
+          # 注意：此处已进入 dist，Bundle 在 Payload 下，路径要带 Payload/ 前缀。
+          # Payload 内的 .app 目录名带后缀，tipa 文件名用 APP_NAME 即可。
+          if [ ! -d "Payload/$APP_BUNDLE" ]; then
+            echo "::error::Payload 中缺少 $APP_BUNDLE"
+            ls -la Payload/ || true
+            exit 1
+          fi
           zip -qry "$APP_NAME.tipa" Payload
+          echo "--- 打包前内容 ---"
+          unzip -l "$APP_NAME.tipa" | head -15
           rm -rf Payload
           ls -lh *.tipa
 
