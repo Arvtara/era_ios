@@ -132,19 +132,62 @@ jobs:
 
       - name: Select Xcode
         run: |
-          echo "--- 可用 Xcode ---"
+          echo "--- /Applications 下的 Xcode ---"
           ls -d /Applications/Xcode*.app || true
-          if [ -d "$XCODE_APP" ]; then
-            TARGET="$XCODE_APP"
-          else
-            echo "::warning::$XCODE_APP 不存在，自动挑选一个可用的（优先较老版本以贴近 Unity 2019.4）"
-            TARGET=$(ls -d /Applications/Xcode_1[56]*.app 2>/dev/null | sort -V | head -n 1)
-            [ -z "$TARGET" ] && TARGET=$(ls -d /Applications/Xcode*.app | sort -V | head -n 1)
+
+          echo "--- 已安装的 iOS 模拟器 runtime ---"
+          xcrun simctl list runtimes 2>/dev/null | grep -i ios || echo "(无 iOS runtime)"
+
+          # 挑选策略：优先选「已安装对应 iOS 模拟器 runtime」的 Xcode。
+          # 原因：编译 LaunchScreen-*.storyboard 用的 ibtool 需要 iOS 平台
+          # runtime，GitHub runner 镜像只预装部分 runtime（2025-08 起最多 3 个），
+          # 若选中没 runtime 的 Xcode 会报
+          #   "LaunchScreen-iPhone.storyboard: error: iOS XX Platform Not Installed."
+          XC_LIST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V)
+          RUNTIMES=$(xcrun simctl list runtimes 2>/dev/null | grep -oiE 'iOS [0-9]+\.[0-9]+' | sort -u)
+
+          TARGET=""
+          if [ -n "$RUNTIMES" ]; then
+            for XC in $XC_LIST; do
+              XCV=$(echo "$XC" | grep -oE 'Xcode_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/Xcode_//')
+              MAJMIN=$(echo "$XCV" | cut -d. -f1,2)
+              if echo "$RUNTIMES" | grep -q "iOS $MAJMIN"; then
+                TARGET="$XC"
+                echo "✓ $XC 有匹配的 iOS runtime ($MAJMIN)"
+                break
+              fi
+            done
           fi
-          echo "选用: $TARGET"
+
+          if [ -z "$TARGET" ]; then
+            echo "::warning::没有 Xcode 与已装 iOS runtime 版本匹配，回退到 $XCODE_APP"
+            TARGET="$XCODE_APP"
+            [ -d "$TARGET" ] || TARGET=$(echo "$XC_LIST" | head -n 1)
+          fi
+
+          echo "最终选用: $TARGET"
           sudo xcode-select -s "$TARGET"
           xcodebuild -version
           echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Ensure iOS platform runtime
+        run: |
+          echo "=== 当前运行时 ==="
+          xcrun simctl list runtimes 2>/dev/null || true
+
+          SDKVER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK: $SDKVER"
+
+          if xcrun simctl list runtimes 2>/dev/null | grep -qi "iOS $SDKVER"; then
+            echo "✓ 已有 iOS $SDKVER runtime，无需下载"
+          else
+            echo "未找到 iOS $SDKVER runtime，尝试下载（较慢，请耐心）..."
+            # -downloadPlatform 只装当前 Xcode 对应的 iOS 平台
+            sudo xcodebuild -downloadPlatform iOS -buildVersion "$SDKVER" || \
+              sudo xcodebuild -downloadPlatform iOS || \
+              echo "::warning::自动下载失败，继续尝试构建（storyboard 可能报错）"
+            xcrun simctl list runtimes 2>/dev/null || true
+          fi
 
       - name: Install ldid
         run: brew install ldid
