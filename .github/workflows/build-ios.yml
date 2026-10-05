@@ -3,14 +3,21 @@
 #
 # 路线：仓库只放 Unity 源工程，云端 runner 现场：
 #         1. 用 Unity 2019.4.40f1c1 导出 Xcode 工程
-#         2. 用 Xcode 14.2 无签名编译
+#         2. 用 Xcode 无签名编译
 #         3. 注入 TrollStore entitlements
 #         4. 打包 .tipa
 #
-# 性能说明（重要）：
+# 运行器选择（重要）：
+#   macos-13 已于 2025-12-04 退役，现在只能选 macos-14 / macos-15。
+#   macos-14 是 ARM64(Apple Silicon)，可用 Xcode 为 15.0.1~16.2。
+#   本 workflow 选最接近 Unity 2019.4 的 Xcode 15.0.1。
+#   Xcode 15 换了新链接器，编译老 Unity 库会报 duplicate symbols，
+#   通过 -ld_classic 切回旧链接器解决。
+#
+# 性能说明：
 #   首次构建需下载 Unity 编辑器 2-3GB，耗时 40-70 分钟属正常。
-#   本 workflow 已缓存 Unity 编辑器与 Library，第二次起约 15-25 分钟。
-#   不要因为"看起来没动"而取消——下载阶段日志不会刷新。
+#   已缓存 Unity 编辑器与 Library，第二次起约 15-25 分钟。
+#   不要因为"看起来没动"而取消——下载阶段日志不刷新。
 # ============================================================
 
 name: Build iOS tipa
@@ -23,11 +30,15 @@ on:
       - 'LICENSE'
   workflow_dispatch:
 
+env:
+  XCODE_APP: /Applications/Xcode_15.0.1.app
+  CACHE_SCOPE: mac-arm64-u2019.4.40f1c1
+
 jobs:
   # ---------- 阶段一：Unity 导出 Xcode 工程 ----------
   export:
     name: Unity export Xcode project
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -35,13 +46,19 @@ jobs:
         with:
           lfs: false
 
+      - name: Show runner info
+        run: |
+          echo "架构: $(uname -m)"
+          echo "macOS: $(sw_vers -productVersion)"
+          ls /Applications | grep -i xcode || true
+
       # ---- 缓存 1：Unity 编辑器本体（省掉 30 分钟下载的关键）----
       - name: Cache Unity Editor
         id: cache-unity
         uses: actions/cache@v4
         with:
           path: /Applications/Unity/Hub/Editor
-          key: UnityEditor-mac-2019.4.40f1c1
+          key: UnityEditor-${{ env.CACHE_SCOPE }}
 
       # ---- 缓存 2：Unity 导入缓存（加速脚本编译）----
       - name: Cache Unity Library
@@ -50,8 +67,8 @@ jobs:
           path: |
             Library
             ~/Library/Unity/cache
-          key: UnityLib-${{ runner.os }}-${{ hashFiles('ProjectSettings/ProjectVersion.txt','Packages/manifest.json') }}
-          restore-keys: UnityLib-${{ runner.os }}-
+          key: UnityLib-${{ env.CACHE_SCOPE }}-${{ hashFiles('ProjectSettings/ProjectVersion.txt','Packages/manifest.json') }}
+          restore-keys: UnityLib-${{ env.CACHE_SCOPE }}-
 
       - name: Notice
         run: |
@@ -98,7 +115,7 @@ jobs:
   build:
     name: Build unsigned tipa
     needs: export
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 90
     steps:
       - name: Download Xcode project
@@ -106,10 +123,11 @@ jobs:
         with:
           name: xcode-project
 
-      - name: Select Xcode 14.2
+      - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_14.2.app
+          sudo xcode-select -s "$XCODE_APP"
           xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
 
       - name: Install ldid
         run: brew install ldid
@@ -130,6 +148,8 @@ jobs:
           EOF
           cat ci/entitlements.plist
 
+      # -ld_classic：Xcode 15 新链接器对老 Unity 静态库会报 duplicate symbols，
+      #              切回旧链接器即可。Unity 2019.4 + Xcode 15 的标准解法。
       - name: Build (no code signing)
         run: |
           set -o pipefail
@@ -143,6 +163,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
+            OTHER_LDFLAGS="-ld_classic" \
             -derivedDataPath build \
             | tee build.log | tail -150
 
