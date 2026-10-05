@@ -32,7 +32,12 @@ on:
 
 env:
   XCODE_APP: /Applications/Xcode_15.0.1.app
-  CACHE_SCOPE: mac-arm64-u2019.4.40f1c1
+  CACHE_SCOPE: mac-arm64-u2019.4.40f1
+  # 注意：GameCI 的 unity-builder 只识别标准版本号。
+  # 本地工程标注的是 2019.4.40f1c1（中国特供版），
+  # 但 GameCI 从 Unity 官方源下载，拉不到 c1 版，
+  # 因此这里用同小版本的标准版 2019.4.40f1。
+  UNITY_VERSION: 2019.4.40f1
 
 jobs:
   # ---------- 阶段一：Unity 导出 Xcode 工程 ----------
@@ -84,7 +89,7 @@ jobs:
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
           targetPlatform: iOS
-          unityVersion: 2019.4.40f1c1
+          unityVersion: ${{ env.UNITY_VERSION }}
           buildMethod: UEmueraBuilder.TuanjieCloudBuild.BuildProject
 
       - name: Locate exported Xcode project
