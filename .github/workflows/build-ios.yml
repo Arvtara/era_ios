@@ -167,6 +167,18 @@ jobs:
 
       # -ld_classic：Xcode 15 新链接器对老 Unity 静态库会报 duplicate symbols，
       #              切回旧链接器即可。Unity 2019.4 + Xcode 15 的标准解法。
+      # Windows 推到 Git 的工程会丢失 Unix 执行位，
+      # Unity 导出的 MapFileParser.sh 等脚本必须可执行，否则 Xcode
+      # 会在 PhaseScriptExecution 阶段报 Permission denied。
+      - name: Fix script permissions
+        run: |
+          echo "--- 修复前 ---"
+          ls -l MapFileParser.sh 2>/dev/null || true
+          find . -name "*.sh" -type f -not -path "./build/*" -exec chmod +x {} \;
+          chmod +x MapFileParser.sh 2>/dev/null || true
+          echo "--- 修复后 ---"
+          ls -l MapFileParser.sh 2>/dev/null || true
+
       - name: Build (no code signing)
         run: |
           set -o pipefail
