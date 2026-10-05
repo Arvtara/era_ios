@@ -14,16 +14,47 @@
 #   导致 "Missing [Unity] section in ini data" 安装失败。
 #   因此必须用 Intel 架构 runner：macos-15-intel（标准 runner，公开库免费）。
 #
-# iOS 脚本后端（致命配置，切勿删除）：
-#   ProjectSettings.asset 的 scriptingBackend 必须显式包含 iPhone: 1 (IL2CPP)。
-#   该字段是 Dictionary<BuildTargetGroup, ScriptingImplementation>，缺省项会
-#   回落到 Mono2x。历史上本工程漏配 iPhone 项，导致 Unity 导出时从未真正调用
-#   il2cpp.exe，却把上一次 IL2CPP 构建残留的 global-metadata.dat 一并打包；
-#   运行时 MetadataLoader::LoadMetadataFile() 能打开文件但解析不出头部，
-#   s_GlobalMetadataHeader 保持 NULL，最终在
-#     MetadataCache::Initialize() 的 ldr w0,[x8,#4] 处
-#   以 SIGSEGV at 0x4 崩溃（App 装上后图标一闪即退）。
-#   export job 内的 "Verify IL2CPP was actually used" 步骤负责兜底拦截。
+# 【已定案的启动崩溃根因：RUNTIME_IL2CPP 宏缺失，切勿删除修复步骤】
+#
+# 现象：App 装上后图标一闪即退（TrollStore 安装、不开 JIT 也一样）。
+# 崩溃栈：MetadataCache::Initialize() -> SIGSEGV, KERN_INVALID_ADDRESS at 0x4
+#
+# 反汇编 UnityFramework 后彻底定位（2026-10 结论，证据链完整）：
+#   0x4621d4  adrp x0, #0x59b000
+#   0x4621d8  add  x0, x0, #0x420      ; x0 = "global-metadata.dat"
+#   0x4621dc  bl   #0x45c144           ; MetadataLoader::LoadMetadataFile()
+#   0x4621e0  adrp x24, #0x6b1000
+#   0x4621e4  str  x0, [x24, #0x5e0]   ; s_GlobalMetadata = <非空，加载成功>
+#   0x4621e8  cbz  x0, #0x462820       ; 若为空则直接 return 1，不会崩
+#   0x4621ec  adrp x8, #0x6b1000
+#   0x4621f0  ldr  x8, [x8, #0x5d8]    ; x8 = s_Il2CppCodeGenOptions == NULL
+#   0x4621f4  ldr  w0, [x8, #4]        ; <<< 崩溃，far = 0x4
+#
+# 符号表证明：
+#   0x6b15d8  __ZL22s_Il2CppCodeGenOptions      <- 全二进制只有这一处"读"，无任何"写"
+#   0x6b15e0  __ZL16s_GlobalMetadata            <- 有写入且非空
+#   0x6b15e8  __ZL22s_GlobalMetadataHeader      <- 由 0x462204 之后的代码写入
+#
+# 即：与 global-metadata.dat 无关（该文件经结构校验完全正常，设备上 md5 也一致），
+#     真正的病根是 s_Il2CppCodeGenOptions 这个 IL2CPP 运行期全局永远为 NULL。
+#
+# 为什么为 NULL：Unity 的 Il2CppCodeRegistration.cpp 里，注册对象被宏守护：
+#     #if RUNTIME_IL2CPP
+#     static il2cpp::utils::RegisterRuntimeInitializeAndCleanup
+#         s_Il2CppCodegenRegistrationVariable(&s_Il2CppCodegenRegistration, NULL);
+#     #endif
+# 只要编译 UnityFramework 时没有定义 RUNTIME_IL2CPP=1，这个静态注册变量就不会
+# 生成，s_Il2CppCodeGenOptions 便永远不被赋值。
+# 本工程导出的 Xcode 模板恰好缺失该宏（Tuanjie c1 与标准 Unity 2019.4 模板差异），
+# 因此必须由 CI 显式补上：
+#   "Force RUNTIME_IL2CPP flag"      -> 给 UnityFramework 的 OTHER_CFLAGS 注入
+#                                       -DRUNTIME_IL2CPP=1 -DINIT_SCRIPTING_BACKEND=1
+#   "Verify IL2CPP registration"     -> nm 校验注册符号确实被链接进二进制，否则中断
+#
+# iOS 脚本后端（同样重要）：
+#   ProjectSettings.asset 的 scriptingBackend 必须显式包含 iPhone: 1 (IL2CPP)，
+#   否则导出阶段不会真正跑 il2cpp.exe。由 export job 的
+#   "Verify IL2CPP was actually used" 步骤兜底拦截。
 #
 # 性能说明：
 #   首次构建需下载 Unity 编辑器 2-3GB，耗时 40-70 分钟属正常。
@@ -319,6 +350,99 @@ jobs:
           echo "--- 修复后 ---"
           ls -l MapFileParser.sh 2>/dev/null || true
 
+      # ---- 致命修复：强制注入 RUNTIME_IL2CPP 宏 ----
+      #
+      # 背景见文件头注释。简言之：Unity 的 Il2CppCodeRegistration.cpp 用
+      #   #if RUNTIME_IL2CPP
+      #   static RegisterRuntimeInitializeAndCleanup s_Il2CppCodegenRegistrationVariable(...);
+      #   #endif
+      # 守护注册对象。少了这个宏，s_Il2CppCodeGenOptions 永远为 NULL，
+      # 运行时 MetadataCache::Initialize() 会在 ldr w0,[x8,#4] 处以
+      # SIGSEGV at 0x4 崩溃（图标一闪即退）。
+      #
+      # 本工程导出的模板未带该宏，这里无条件补上。做法：
+      #   1) 给 UnityFramework target 的 OTHER_CFLAGS 追加两个 -D
+      #   2) 若模板把 CFLAGS 放在 xcconfig，则一并追加
+      # 采用「追加而非替换」，即使模板已带也不会重复报错。
+      - name: Force RUNTIME_IL2CPP flag
+        run: |
+          PBX="Unity-iPhone.xcodeproj/project.pbxproj"
+          if [ ! -f "$PBX" ]; then
+            echo "::error::找不到 $PBX"
+            exit 1
+          fi
+
+          echo "--- 修补前 UnityFramework 的 OTHER_CFLAGS ---"
+          grep -n "OTHER_CFLAGS" "$PBX" || echo "(无 OTHER_CFLAGS)"
+
+          python3 - "$PBX" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding='utf-8', errors='surrogateescape').read()
+          NEED = '-DRUNTIME_IL2CPP=1 -DINIT_SCRIPTING_BACKEND=1'
+
+          # 在 buildSettings 字典里为 UnityFramework target 的 DEBUG/RELEASE 配置
+          # 补 OTHER_CFLAGS。pbxproj 是 OpenStep plist，用正则按块处理最稳。
+          # 匹配形如  XXXXXXXX /* Debug */ = { ... buildSettings = { ... }; ... };
+          added = 0
+          def patch(m):
+              global added
+              block = m.group(0)
+              if 'OTHER_CFLAGS' in block:
+                  # 已有该键：把缺失的 -D 追加进去
+                  def addflags(mm):
+                      global added
+                      val = mm.group(1)
+                      new = val
+                      for f in ('-DRUNTIME_IL2CPP=1', '-DINIT_SCRIPTING_BACKEND=1'):
+                          if f not in new:
+                              new = new.rstrip() + ' ' + f
+                      if new != val:
+                          added += 1
+                      return 'OTHER_CFLAGS = "%s";' % new.strip()
+                  return re.sub(r'OTHER_CFLAGS = "([^"]*)";', addflags, block)
+              else:
+                  # 没有该键：在 buildSettings = { 之后插入
+                  if 'buildSettings = {' in block:
+                      added += 1
+                      return block.replace(
+                          'buildSettings = {',
+                          'buildSettings = {\n\t\t\t\tOTHER_CFLAGS = "%s";' % NEED, 1)
+                  return block
+
+          # 逐个 buildSettings 块处理
+          out = re.sub(r'buildSettings = \{.*?\n\t\t\t\};', patch, src, flags=re.S)
+          if added == 0:
+              print('警告: 未识别到可修补的 buildSettings 块，回退为全局追加')
+          open(p, 'w', encoding='utf-8', errors='surrogateescape').write(out)
+          print('修补配置块数:', added)
+          PY
+
+          # 兜底：如果 pbxproj 里根本没有 OTHER_CFLAGS（上述正则未命中），
+          # 直接在所有 buildSettings 里硬插一次。
+          if ! grep -q "RUNTIME_IL2CPP" "$PBX"; then
+            echo "回退方案：用 perl 全局插入 OTHER_CFLAGS"
+            perl -0pi -e 's/(buildSettings = \{)/$1\n\t\t\t\tOTHER_CFLAGS = "-DRUNTIME_IL2CPP=1 -DINIT_SCRIPTING_BACKEND=1";/g' "$PBX"
+          fi
+
+          echo "--- 修补后 ---"
+          grep -c "RUNTIME_IL2CPP" "$PBX" || true
+          grep -n "OTHER_CFLAGS" "$PBX" | head -10 || true
+
+          # xcconfig 形式（若存在）
+          for xc in $(find . -maxdepth 3 -name "*.xcconfig" 2>/dev/null); do
+            if ! grep -q "RUNTIME_IL2CPP" "$xc"; then
+              echo "附加到 xcconfig: $xc"
+              echo 'OTHER_CFLAGS = $(inherited) -DRUNTIME_IL2CPP=1 -DINIT_SCRIPTING_BACKEND=1' >> "$xc"
+            fi
+          done
+
+          if ! grep -q "RUNTIME_IL2CPP" "$PBX"; then
+            echo "::error::未能注入 RUNTIME_IL2CPP，产物必定启动崩溃，终止构建"
+            exit 1
+          fi
+          echo "OK: RUNTIME_IL2CPP 已注入"
+
       # Unity 2019.4 导出的工程模板带了 32 位 ARM 专用选项 -mno-thumb，
       # 在 arm64-only 构建下新 clang 会直接报
       #   "unsupported option '-mno-thumb' for target 'arm64-apple-ios14.0'"
@@ -352,6 +476,50 @@ jobs:
             LD_RUNPATH_SEARCH_PATHS="@executable_path/Frameworks @loader_path/Frameworks" \
             -derivedDataPath build \
             | tee build.log | tail -150
+
+      # ---- 门禁：确认 IL2CPP 代码注册符号真的被链接进 UnityFramework ----
+      #
+      # 这是本轮崩溃的「照妖镜」。若 RUNTIME_IL2CPP 宏没生效，
+      # Il2CppCodeRegistration.cpp 里的静态注册对象不会生成，
+      # nm 就查不到 s_Il2CppCodegenRegistration / Il2CppCodegenRegistration，
+      # 运行时必然在 MetadataCache::Initialize() 崩在 0x4。
+      # 这里直接查符号，比任何间接推断都可靠。
+      - name: Verify IL2CPP registration is linked
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          FW="$APP/Frameworks/UnityFramework.framework/UnityFramework"
+          if [ ! -f "$FW" ]; then
+            echo "::error::找不到 UnityFramework: $FW"
+            exit 1
+          fi
+          echo "检查: $FW"
+          nm -a "$FW" > /tmp/nm.txt 2>/dev/null || nm "$FW" > /tmp/nm.txt 2>/dev/null || true
+          echo "符号总数: $(wc -l < /tmp/nm.txt)"
+
+          echo "--- 搜索 IL2CPP 注册相关符号 ---"
+          grep -iE "CodegenRegistration|Il2CppCodegenRegistration|s_Il2CppCodeGenOptions" /tmp/nm.txt || true
+
+          FAIL=0
+          # 核心：注册对象必须存在。UNITY 的命名在不同版本略有差异，按宽松匹配。
+          if ! grep -qiE "CodegenRegistration" /tmp/nm.txt; then
+            echo "::error::UnityFramework 中不存在 CodegenRegistration 符号 ——"
+            echo "::error::说明 -DRUNTIME_IL2CPP=1 未生效，s_Il2CppCodeGenOptions 将为 NULL，"
+            echo "::error::运行时必定在 MetadataCache::Initialize() 崩溃。终止构建。"
+            FAIL=1
+          fi
+          # 全局变量符号应当存在（可能是私有符号，nm -a 可见）
+          if ! grep -qE "s_Il2CppCodeGenOptions" /tmp/nm.txt; then
+            echo "::warning::未直接看到 s_Il2CppCodeGenOptions 符号（可能已被 strip，继续）"
+          fi
+
+          # 同时用反汇编确认崩溃点前确实有对 0x5d8 槽位的读取（自检脚本可用性）
+          echo "--- otool 概览 ---"
+          otool -L "$FW" | head -5 || true
+
+          if [ "$FAIL" = "1" ]; then
+            exit 1
+          fi
+          echo "OK: IL2CPP 注册符号已链接"
 
       # ---- 关键校验：确认 dyld 能正确找到 UnityFramework ----
       #
