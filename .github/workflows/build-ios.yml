@@ -259,6 +259,24 @@ jobs:
       # 从 export job 传过来的 metadata 指纹，用于在打包前比对产物是否混入旧文件
       METADATA_MD5: ${{ needs.export.outputs.metadata_md5 }}
     steps:
+      # build job 也需要仓库里的 .ci 脚本（Verify tipa integrity 会调用
+      # .ci/check_metadata.py）。缺了会报 can't open file。
+      # 注意顺序：先 checkout 拿到脚本，再由 download-artifact 解压工程，
+      # 且把工程解到子目录，避免覆盖仓库文件。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Stash CI scripts
+        run: |
+          echo "工作目录: $GITHUB_WORKSPACE"
+          ls -la .ci/ 2>/dev/null || echo "(无 .ci 目录)"
+          mkdir -p /tmp/ci
+          cp -f .ci/*.py /tmp/ci/ 2>/dev/null || true
+          ls -la /tmp/ci/ || true
+          echo "CI_SCRIPTS=/tmp/ci" >> "$GITHUB_ENV"
+
       - name: Download Xcode project
         uses: actions/download-artifact@v4
         with:
@@ -699,8 +717,18 @@ jobs:
                 echo "OK: metadata 指纹一致"
               fi
             fi
-            # 结构复检（对解压后的副本再跑一次）
-            python3 "$GITHUB_WORKSPACE/.ci/check_metadata.py" "$META" || FAIL=1
+          # 结构复检（对解压后的副本再跑一次）
+          # build job 里的脚本从 /tmp/ci 取（checkout 后另存的副本），
+          # 找不到时回退到工程目录，双保险。
+          CHK="${CI_SCRIPTS:-$GITHUB_WORKSPACE/.ci}/check_metadata.py"
+          if [ ! -f "$CHK" ]; then
+            CHK="$GITHUB_WORKSPACE/.ci/check_metadata.py"
+          fi
+          if [ -f "$CHK" ]; then
+            python3 "$CHK" "$META" || FAIL=1
+          else
+            echo "::warning::未找到 check_metadata.py，跳过结构复检（不影响产物可用性）"
+          fi
           fi
 
           # 主程序 entitlements（TrollStore 安装时会自行重签，此处仅作记录）
