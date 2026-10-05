@@ -19,19 +19,25 @@ UserSettings/
 *.svd
 crashlytics-build.properties
 
-# ---- ★ 关键：Unity 导出的 Xcode 工程里的大文件 ★ ----
-# 这两个是 IL2CPP/Runtime 静态库，Xcode 构建时会自动重新生成，
-# 单个 113MB / 597MB，远超 GitHub 100MB 硬限制，必须排除。
-Libraries/
-*.a
-*.dylib
-*.so
+# ---- ★ 只拦截 Unity 导出的 Xcode 工程里的大文件 ★ ----
+# 注意：绝对不要用裸的 "*.a" 规则！
+# Assets/unity.webp/Plugins/iOS/*.a 是项目必需的 iOS 原生静态库
+# （libwebp / libwebpdecoder / libwebpdemux，共约 5MB），
+# 一旦被忽略，Xcode 链接阶段会报 WebP 符号未定义。
+# 真正需要排除的只有导出目录下这两个超大文件：
+Libraries/libiPhone-lib.a
+Libraries/libil2cpp.a
+Libraries/libGameAssembly.a
+/Unity-iPhone.xcodeproj/
+/Libraries/
+/Data/
+/DerivedData/
 
 # ---- 构建产物 ----
 build/
-DerivedData/
 dist/
 Payload/
+Build/
 *.tipa
 *.ipa
 *.app
@@ -52,10 +58,10 @@ xcuserdata/
 *~
 
 # ============================================================
-# 注意：以下内容是构建必需的，切勿加入忽视列表
-#   Classes/            Unity 与 Objective-C 集成代码
-#   Data/               资源与托管程序集
-#   UnityFramework.framework/
-#   Unity-iPhone.xcodeproj/  （若走"提交完整 Xcode 工程"路线）
-#   Info.plist / main.mm
+# 显式放行：这些是构建必需的，切勿加入忽视列表
 # ============================================================
+!Assets/unity.webp/Plugins/**
+!Assets/unity.webp/Plugins/iOS/*.a
+!Assets/Plugins/**
+!Classes/
+!Data/
