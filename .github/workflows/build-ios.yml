@@ -244,35 +244,96 @@ jobs:
           echo "--- 检查残留 ---"
           grep -rn -- "-mno-thumb" Unity-iPhone.xcodeproj/ 2>/dev/null || echo "✓ 已无 -mno-thumb"
 
-      # ---- 关键修复：剔除重复的类注册源文件 ----
+      # ---- 关键修复：剔除重复的类注册源文件（必须两手都做）----
       #
       # Unity 2019.4 导出的工程里存在两套并存的 class/icall 注册实现：
-      #   RegisterMonoModules.cpp          <- 2019.x 的正确实现，必须保留
-      #   UnityClassRegistration.mm        <- 新版本实现，必须剔除
-      #   UnityICallRegistration.cpp       <- 新版本 icall 实现，必须剔除
-      # 它们定义了完全相同的 4 个符号：
-      #   RegisterAllClasses() / InvokeRegisterStaticallyLinkedModuleClasses()
-      #   / _RegisterStaticallyLinkedModulesGranular / RegisterAllStrippedInternalCalls()
-      # 同时编入 UnityFramework 就会在链接期报 duplicate symbol。
+      #   Libraries/RegisterMonoModules.cpp   <- 2019.x 的正确实现，必须保留
+      #   Classes/Native/UnityClassRegistration.cpp
+      #   Classes/Native/UnityICallRegistration.cpp   <- 必须剔除
+      # 它们定义了相同的符号（RegisterAllClasses()、
+      # InvokeRegisterStaticallyLinkedModuleClasses()、
+      # _RegisterStaticallyLinkedModulesGranular、RegisterAllStrippedInternalCalls()），
+      # 同时编入 UnityFramework 会在链接期报 duplicate symbol。
       #
-      # 注意：Xcode 目标带 PBXFileSystemSynchronizedRootGroup/openStep 同步组时，
-      # 源文件会自动纳入 Compile Sources，仅改 pbxproj 删不干净。因此这里直接
-      # 删除磁盘上的 .mm/.cpp 文件——文件不存在，同步组自然不会再编译它。
+      # 踩坑记录：只改 pbxproj 删条目 → 文件仍在，仍被编译，重复符号照旧；
+      #           只删文件 → pbxproj 里 CompileC 条目仍在，Xcode 直接报
+      #             "Build input file cannot be found"。
+      #           必须两步都做：先从 pbxproj 摘掉编译条目，再删磁盘文件。
+      - name: Prepare pbxproj stripping script
+        run: |
+          cat > .ci_strip_registration.py <<'PYEOF'
+          import re, sys
+
+          pbx = sys.argv[1]
+          targets = ['UnityClassRegistration', 'UnityICallRegistration']
+
+          with open(pbx, encoding='utf-8', errors='surrogateescape') as fh:
+              lines = fh.read().split('\n')
+
+          # 1) 收集与目标文件相关的所有 24 位 UUID（PBXBuildFile / PBXFileReference 等）
+          uuids = set()
+          for ln in lines:
+              if any(t in ln for t in targets):
+                  uuids.update(re.findall(r'\b[0-9A-Fa-f]{24}\b', ln))
+
+          # 2) 整行删除：命中文件名、引用其 UUID、或仅剩分隔符的残留行
+          out, removed = [], 0
+          for ln in lines:
+              hit = any(t in ln for t in targets) or any(u in ln for u in uuids)
+              if not hit and re.match(r'^\s*[;,]\s*$', ln):
+                  hit = True
+              if hit:
+                  removed += 1
+              else:
+                  out.append(ln)
+
+          with open(pbx, 'w', encoding='utf-8', errors='surrogateescape') as fh:
+              fh.write('\n'.join(out))
+
+          print('pbxproj: 删除 %d 行, 关联 UUID %d 个' % (removed, len(uuids)))
+
+          # 3) 平衡性自检：花括号/圆括号数量必须仍然成对
+          txt = '\n'.join(out)
+          if txt.count('{') != txt.count('}') or txt.count('(') != txt.count(')'):
+              print('::error::pbxproj 结构可能已被破坏（括号不平衡）')
+              sys.exit(1)
+          print('OK: pbxproj 括号平衡')
+          PYEOF
+          echo "已生成 .ci_strip_registration.py"
+
       - name: Remove duplicate class registration sources
         run: |
-          echo "--- 目标源文件 ---"
+          PBX=Unity-iPhone.xcodeproj/project.pbxproj
+
+          echo "--- 移除前，pbxproj 中的相关条目 ---"
+          grep -nE "UnityClassRegistration|UnityICallRegistration" "$PBX" | head -30 || echo "(无)"
+
+          cp "$PBX" "$PBX.bak"
+          python3 .ci_strip_registration.py "$PBX"
+
+          echo "--- pbxproj 校验 ---"
+          if grep -qE "UnityClassRegistration|UnityICallRegistration" "$PBX"; then
+            echo "::warning::pbxproj 仍有残留引用"
+            grep -nE "UnityClassRegistration|UnityICallRegistration" "$PBX" | head -10 || true
+          else
+            echo "OK: pbxproj 已无相关引用"
+          fi
+
+          # 顺序很重要：先摘掉 pbxproj 条目，再删磁盘文件
+          echo "--- 删除源文件 ---"
           for f in UnityClassRegistration.mm UnityClassRegistration.cpp \
                    UnityICallRegistration.cpp UnityICallRegistration.mm; do
             find . -type f -name "$f" -not -path "./build/*" -print -delete || true
           done
-          echo "--- 校验（应无残留）---"
+
+          echo "--- 最终校验 ---"
           if find . -type f \( -name "UnityClassRegistration.*" -o -name "UnityICallRegistration.*" \) \
                -not -path "./build/*" | grep -q .; then
-            echo "::warning::仍存在重复注册源文件，链接可能继续失败"
+            echo "::warning::仍存在重复注册源文件"
           else
-            echo "OK: 已移除 UnityClassRegistration / UnityICallRegistration"
+            echo "OK: 源文件已移除"
           fi
-          echo "--- RegisterMonoModules 是否仍在（必须存在）---"
+          echo "保留（必须存在）:"
           find . -type f -name "RegisterMonoModules.*" -not -path "./build/*"
 
       - name: Build (no code signing)
