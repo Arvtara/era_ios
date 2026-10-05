@@ -232,6 +232,62 @@ jobs:
       #   magic / version、31 个 section 的越界与重叠、字符串堆可解码性。
       # 目的是在打包前排除"构建侧文件本身损坏/截断"这一分支。
       # 若此处通过、设备上仍启动崩溃，则问题在打包/安装链路，而非构建。
+      # ---- 致命校验：确认 iOS 渲染后端候选列表含 Metal ----
+      #
+      # 背景（本轮启动崩溃的真正根因）：
+      # ProjectSettings.asset 的 m_BuildTargetGraphicsAPIs 为空数组时，
+      # Unity 导出会走兜底分支，把候选渲染 API 填成 OpenGLES2。
+      # iOS 16 以后的 A 系列设备上 EAGLContext 无法创建 OpenGLES2 上下文，
+      # SelectRenderingAPIImpl() 遍历完所有候选后返回 0，_renderingAPI 保持 0，
+      # 于是 App 启动瞬间在 renderingAPI 处断言失败：
+      #
+      #   NSAssert(_renderingAPI != 0,
+      #       @"[UnityAppController renderingAPI] called before "
+      #        "[UnityAppController selectRenderingApi]");
+      #
+      # 崩溃栈（iPhone SE 3 / iOS 16.3）：
+      #   -[UnityAppController(Rendering) renderingAPI]
+      #   -[UnityAppController application:didFinishLaunchingWithOptions:]
+      #   _userInfoForFileAndLine -> NSInternalInconsistencyException -> abort()
+      #
+      # 反汇编 UnityFramework 中 UnityGetRenderingAPIs 可确认兜底行为：
+      #   配置数量为 0 -> apis[0] = 2 (apiOpenGLES2)，返回 1
+      #   配置 0x08 -> apiOpenGLES2 / 0x0b -> apiOpenGLES3 / 0x10 -> apiMetal
+      #
+      # 构建脚本已在导出前强制设置并写入 build-info.txt，这里读回来复核。
+      - name: Verify iOS graphics API is Metal
+        run: |
+          INFO=$(find . -name "build-info.txt" | head -n 1)
+          if [ -z "$INFO" ]; then
+            echo "::warning::未找到 build-info.txt，无法复核图形 API 配置"
+            exit 0
+          fi
+          echo "--- build-info.txt ---"
+          cat "$INFO"
+
+          API=$(grep -i '^ios_graphics_api=' "$INFO" | cut -d= -f2-)
+          echo "ios_graphics_api = $API"
+
+          if [ -z "$API" ]; then
+            echo "::warning::build-info.txt 中无 ios_graphics_api 字段，跳过复核"
+            exit 0
+          fi
+          if [ "$API" != "Metal" ]; then
+            echo "::error::iOS 图形 API 当前为 '$API'，不是 Metal。"
+            echo "::error::Unity 会把候选渲染 API 兜底成 OpenGLES2，"
+            echo "::error::在 iOS 16+ 的 A 系列设备上必然启动即崩溃。终止构建。"
+            exit 1
+          fi
+          echo "OK: iOS 图形 API 已确认为 Metal"
+
+          # 顺带确认导出的 Xcode 工程里确实编译了 Metal 后端
+          NATIVE="$PROJ_DIR/Classes/Native"
+          if [ -d "$NATIVE" ]; then
+            HITS=$(grep -ril "GfxDeviceMetal\|MetalContext\|UnityGetRenderingAPIs" "$NATIVE" 2>/dev/null | wc -l | tr -d ' ')
+            echo "Native 目录中提及 Metal 相关符号的文件数: $HITS"
+          fi
+
+
       - name: Validate global-metadata structure
         run: |
           META=$(find "$PROJ_DIR" -name "global-metadata.dat" | head -n 1)
