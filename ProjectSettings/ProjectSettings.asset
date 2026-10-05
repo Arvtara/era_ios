@@ -793,9 +793,11 @@ PlayerSettings:
     iPhone: 1
   scriptingBackend:
     Android: 1
+    iPhone: 1
     Standalone: 1
   il2cppCompilerConfiguration: {}
-  managedStrippingLevel: {}
+  managedStrippingLevel:
+    iPhone: 1
   incrementalIl2cppBuild: {}
   suppressCommonWarnings: 1
   allowUnsafeCode: 0
