@@ -239,6 +239,58 @@ jobs:
           echo "--- 检查残留 ---"
           grep -rn -- "-mno-thumb" Unity-iPhone.xcodeproj/ 2>/dev/null || echo "✓ 已无 -mno-thumb"
 
+      # Unity 2019.4 导出的工程里，旧注册机制 RegisterMonoModules.cpp 与
+      # 新注册机制 UnityClassRegistration.mm 会同时存在，两者定义了相同的
+      # 4 个符号，导致链接期报：
+      #   duplicate symbol 'RegisterAllClasses()' in
+      #       RegisterMonoModules.o / UnityClassRegistration.o
+      # Unity 2019.4 应使用旧机制，故从 pbxproj 中剔除 UnityClassRegistration。
+      - name: Remove duplicate UnityClassRegistration
+        run: |
+          cat > .ci_strip_registration.py <<'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding='utf-8', errors='surrogateescape').read()
+          lines = src.split('\n')
+          # 1) 找出所有与 UnityClassRegistration 相关条目的 UUID
+          uuids = set()
+          for ln in lines:
+              if 'UnityClassRegistration' in ln:
+                  m = re.match(r'\s*([0-9A-Fa-f]{24})\s*(?:/\*.*?\*/)?\s*=', ln)
+                  if m:
+                      uuids.add(m.group(1))
+          # 2) 删除所有直接提及该文件、或引用这些 UUID 的行
+          out, removed = [], 0
+          for ln in lines:
+              hit = 'UnityClassRegistration' in ln
+              if not hit:
+                  for u in uuids:
+                      if u in ln:
+                          hit = True
+                          break
+              if hit:
+                  removed += 1
+              else:
+                  out.append(ln)
+          open(p, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(out))
+          print(f"已删除 {removed} 行, 涉及 UUID {len(uuids)} 个: {sorted(uuids)}")
+          PYEOF
+
+          PBX=Unity-iPhone.xcodeproj/project.pbxproj
+          if grep -q "UnityClassRegistration" "$PBX"; then
+            echo "发现 UnityClassRegistration 引用，从工程中剔除..."
+            cp "$PBX" "$PBX.orig"
+            python3 .ci_strip_registration.py "$PBX"
+            echo "--- 校验 ---"
+            if grep -q "UnityClassRegistration" "$PBX"; then
+              echo "::warning::仍存在 UnityClassRegistration 引用"
+            else
+              echo "OK: pbxproj 中已无 UnityClassRegistration"
+            fi
+          else
+            echo "工程中未引用 UnityClassRegistration，跳过"
+          fi
+
       - name: Build (no code signing)
         run: |
           set -o pipefail
