@@ -363,22 +363,37 @@ jobs:
             exit 1
           fi
           APP_NAME=$(basename "$APP_PATH" .app)
+          # 注意：$APP_NAME 是去掉了 .app 后缀的名字（如 uEmuera），
+          # 而 Payload 下的目录保留完整后缀（uEmuera.app）。
+          # 二者不同，务必用 APP_BUNDLE 拼路径，否则 ldid 会报 errno=2。
           echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "APP_BUNDLE=$APP_NAME.app" >> $GITHUB_ENV
           mkdir -p dist/Payload
           cp -R "$APP_PATH" dist/Payload/
           echo "产物: $APP_PATH"
-          echo "--- 产物架构（应含 arm64）---"
-          lipo -info "dist/Payload/$APP_NAME/$APP_NAME" || true
+          echo "--- Payload 内容 ---"
+          ls -la dist/Payload/
+          echo "--- 可执行文件架构（应含 arm64）---"
+          lipo -info "dist/Payload/$APP_NAME.app/$APP_NAME" || true
 
       - name: Inject TrollStore entitlements
         run: |
-          ldid -Sci/entitlements.plist "dist/Payload/$APP_NAME/$APP_NAME"
+          BIN="dist/Payload/$APP_BUNDLE/$APP_NAME"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::找不到可执行文件: $BIN"
+            ls -la "dist/Payload/$APP_BUNDLE/" || true
+            exit 1
+          fi
+          ldid -Sci/entitlements.plist "$BIN"
           echo "已注入 no-sandbox + platform-application"
-          ldid -e "dist/Payload/$APP_NAME/$APP_NAME" || true
+          echo "--- 回读校验 ---"
+          ldid -e "$BIN" || true
 
       - name: Package tipa
         run: |
           cd dist
+          # Payload 下的 .app 目录名带后缀，tipa 文件名用 APP_NAME 即可
+          [ -d "$APP_BUNDLE" ] || { echo "::error::Payload 中缺少 $APP_BUNDLE"; ls -la; exit 1; }
           zip -qry "$APP_NAME.tipa" Payload
           rm -rf Payload
           ls -lh *.tipa
