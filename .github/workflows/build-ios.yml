@@ -222,6 +222,23 @@ jobs:
           echo "--- 修复后 ---"
           ls -l MapFileParser.sh 2>/dev/null || true
 
+      # Unity 2019.4 导出的工程模板带了 32 位 ARM 专用选项 -mno-thumb，
+      # 在 arm64-only 构建下新 clang 会直接报
+      #   "unsupported option '-mno-thumb' for target 'arm64-apple-ios14.0'"
+      # 这里从 pbxproj 与 xcconfig 中就地移除。
+      - name: Strip -mno-thumb flag
+        run: |
+          for f in Unity-iPhone.xcodeproj/project.pbxproj $(find . -maxdepth 2 -name "*.xcconfig" 2>/dev/null); do
+            [ -f "$f" ] || continue
+            if grep -q -- "-mno-thumb" "$f"; then
+              echo "修补: $f"
+              sed -i.bak 's/ -mno-thumb//g; s/-mno-thumb //g; s/-mno-thumb//g' "$f"
+              rm -f "$f.bak"
+            fi
+          done
+          echo "--- 检查残留 ---"
+          grep -rn -- "-mno-thumb" Unity-iPhone.xcodeproj/ 2>/dev/null || echo "✓ 已无 -mno-thumb"
+
       - name: Build (no code signing)
         run: |
           set -o pipefail
@@ -236,6 +253,8 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             OTHER_LDFLAGS="-ld_classic" \
+            OTHER_CFLAGS="" \
+            GCC_PRECOMPILE_PREFIX_HEADER=NO \
             -derivedDataPath build \
             | tee build.log | tail -150
 
