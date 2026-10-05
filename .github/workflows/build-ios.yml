@@ -16,6 +16,11 @@
 #   Xcode 16 的新链接器编译老 Unity 库会报 duplicate symbols，
 #   通过 -ld_classic 切回旧链接器解决。
 #
+# 链接期已知问题（本文件已处理，勿回退）：
+#   Unity 2019.4 导出的工程同时带两套注册实现，
+#   RegisterMonoModules.cpp 与 UnityClassRegistration.mm /
+#   UnityICallRegistration.cpp 定义同名符号，必须删掉后者（步骤见 build job）。
+#
 # 性能说明：
 #   首次构建需下载 Unity 编辑器 2-3GB，耗时 40-70 分钟属正常。
 #   已缓存 Unity 编辑器与 Library，第二次起约 15-25 分钟。
@@ -239,57 +244,36 @@ jobs:
           echo "--- 检查残留 ---"
           grep -rn -- "-mno-thumb" Unity-iPhone.xcodeproj/ 2>/dev/null || echo "✓ 已无 -mno-thumb"
 
-      # Unity 2019.4 导出的工程里，旧注册机制 RegisterMonoModules.cpp 与
-      # 新注册机制 UnityClassRegistration.mm 会同时存在，两者定义了相同的
-      # 4 个符号，导致链接期报：
-      #   duplicate symbol 'RegisterAllClasses()' in
-      #       RegisterMonoModules.o / UnityClassRegistration.o
-      # Unity 2019.4 应使用旧机制，故从 pbxproj 中剔除 UnityClassRegistration。
-      - name: Remove duplicate UnityClassRegistration
+      # ---- 关键修复：剔除重复的类注册源文件 ----
+      #
+      # Unity 2019.4 导出的工程里存在两套并存的 class/icall 注册实现：
+      #   RegisterMonoModules.cpp          <- 2019.x 的正确实现，必须保留
+      #   UnityClassRegistration.mm        <- 新版本实现，必须剔除
+      #   UnityICallRegistration.cpp       <- 新版本 icall 实现，必须剔除
+      # 它们定义了完全相同的 4 个符号：
+      #   RegisterAllClasses() / InvokeRegisterStaticallyLinkedModuleClasses()
+      #   / _RegisterStaticallyLinkedModulesGranular / RegisterAllStrippedInternalCalls()
+      # 同时编入 UnityFramework 就会在链接期报 duplicate symbol。
+      #
+      # 注意：Xcode 目标带 PBXFileSystemSynchronizedRootGroup/openStep 同步组时，
+      # 源文件会自动纳入 Compile Sources，仅改 pbxproj 删不干净。因此这里直接
+      # 删除磁盘上的 .mm/.cpp 文件——文件不存在，同步组自然不会再编译它。
+      - name: Remove duplicate class registration sources
         run: |
-          cat > .ci_strip_registration.py <<'PYEOF'
-          import re, sys
-          p = sys.argv[1]
-          src = open(p, encoding='utf-8', errors='surrogateescape').read()
-          lines = src.split('\n')
-          # 1) 找出所有与 UnityClassRegistration 相关条目的 UUID
-          uuids = set()
-          for ln in lines:
-              if 'UnityClassRegistration' in ln:
-                  m = re.match(r'\s*([0-9A-Fa-f]{24})\s*(?:/\*.*?\*/)?\s*=', ln)
-                  if m:
-                      uuids.add(m.group(1))
-          # 2) 删除所有直接提及该文件、或引用这些 UUID 的行
-          out, removed = [], 0
-          for ln in lines:
-              hit = 'UnityClassRegistration' in ln
-              if not hit:
-                  for u in uuids:
-                      if u in ln:
-                          hit = True
-                          break
-              if hit:
-                  removed += 1
-              else:
-                  out.append(ln)
-          open(p, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(out))
-          print(f"已删除 {removed} 行, 涉及 UUID {len(uuids)} 个: {sorted(uuids)}")
-          PYEOF
-
-          PBX=Unity-iPhone.xcodeproj/project.pbxproj
-          if grep -q "UnityClassRegistration" "$PBX"; then
-            echo "发现 UnityClassRegistration 引用，从工程中剔除..."
-            cp "$PBX" "$PBX.orig"
-            python3 .ci_strip_registration.py "$PBX"
-            echo "--- 校验 ---"
-            if grep -q "UnityClassRegistration" "$PBX"; then
-              echo "::warning::仍存在 UnityClassRegistration 引用"
-            else
-              echo "OK: pbxproj 中已无 UnityClassRegistration"
-            fi
+          echo "--- 目标源文件 ---"
+          for f in UnityClassRegistration.mm UnityClassRegistration.cpp \
+                   UnityICallRegistration.cpp UnityICallRegistration.mm; do
+            find . -type f -name "$f" -not -path "./build/*" -print -delete || true
+          done
+          echo "--- 校验（应无残留）---"
+          if find . -type f \( -name "UnityClassRegistration.*" -o -name "UnityICallRegistration.*" \) \
+               -not -path "./build/*" | grep -q .; then
+            echo "::warning::仍存在重复注册源文件，链接可能继续失败"
           else
-            echo "工程中未引用 UnityClassRegistration，跳过"
+            echo "OK: 已移除 UnityClassRegistration / UnityICallRegistration"
           fi
+          echo "--- RegisterMonoModules 是否仍在（必须存在）---"
+          find . -type f -name "RegisterMonoModules.*" -not -path "./build/*"
 
       - name: Build (no code signing)
         run: |
@@ -322,6 +306,8 @@ jobs:
           mkdir -p dist/Payload
           cp -R "$APP_PATH" dist/Payload/
           echo "产物: $APP_PATH"
+          echo "--- 产物架构（应含 arm64）---"
+          lipo -info "dist/Payload/$APP_NAME/$APP_NAME" || true
 
       - name: Inject TrollStore entitlements
         run: |
