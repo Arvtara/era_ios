@@ -195,6 +195,21 @@ jobs:
           fi
           echo "OK: IL2CPP 导出校验通过"
 
+      # ---- metadata 结构自检 ----
+      #
+      # 对 il2cpp 生成的 global-metadata.dat 做逐 section 校验：
+      #   magic / version、31 个 section 的越界与重叠、字符串堆可解码性。
+      # 目的是在打包前排除"构建侧文件本身损坏/截断"这一分支。
+      # 若此处通过、设备上仍启动崩溃，则问题在打包/安装链路，而非构建。
+      - name: Validate global-metadata structure
+        run: |
+          META=$(find "$PROJ_DIR" -name "global-metadata.dat" | head -n 1)
+          if [ -z "$META" ]; then
+            echo "::error::找不到 global-metadata.dat"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/.ci/check_metadata.py" "$META"
+
       - name: Upload Xcode project as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -452,6 +467,87 @@ jobs:
           unzip -l "$APP_NAME.tipa" | head -15
           rm -rf Payload
           ls -lh *.tipa
+          echo "TIPA_PATH=dist/$APP_NAME.tipa" >> "$GITHUB_ENV"
+
+      # ---- 打包后回验：解压 tipa，核对关键文件是否与源一致 ----
+      #
+      # 用于捕捉打包/压缩环节引入的文件损坏：
+      #   - global-metadata.dat 的 md5 必须与 export 阶段指纹一致
+      #   - 关键文件（主程序、UnityFramework、Info.plist）必须齐全
+      #   - 主程序必须可执行，且携带 TrollStore 所需 entitlements
+      - name: Verify tipa integrity
+        run: |
+          TIPA="${TIPA_PATH:-dist/$APP_NAME.tipa}"
+          echo "检查: $TIPA"
+          rm -rf /tmp/tipa_check && mkdir -p /tmp/tipa_check
+          unzip -q "$TIPA" -d /tmp/tipa_check
+
+          APP="/tmp/tipa_check/Payload/$APP_BUNDLE"
+          FAIL=0
+
+          echo "--- 关键文件 ---"
+          for f in "$APP_NAME" "Info.plist" \
+                   "Frameworks/UnityFramework.framework/UnityFramework" \
+                   "Data/Managed/Metadata/global-metadata.dat"; do
+            if [ -e "$APP/$f" ]; then
+              ls -l "$APP/$f"
+            else
+              echo "::error::缺少 $f"
+              FAIL=1
+            fi
+          done
+
+          if [ ! -x "$APP/$APP_NAME" ]; then
+            echo "::error::主程序缺失或不可执行: $APP/$APP_NAME"
+            FAIL=1
+          fi
+          if [ ! -f "$APP/Frameworks/UnityFramework.framework/UnityFramework" ]; then
+            echo "::error::UnityFramework 缺失"
+            FAIL=1
+          fi
+          if [ ! -f "$APP/Info.plist" ]; then
+            echo "::error::Info.plist 缺失"
+            FAIL=1
+          fi
+
+          # metadata 指纹比对
+          META="$APP/Data/Managed/Metadata/global-metadata.dat"
+          if [ ! -f "$META" ]; then
+            echo "::error::tipa 内缺少 global-metadata.dat"
+            FAIL=1
+          else
+            MD5=$(md5 -q "$META" 2>/dev/null || md5sum "$META" | awk '{print $1}')
+            SZ=$(stat -f%z "$META" 2>/dev/null || stat -c%s "$META")
+            echo "tipa 内 metadata: md5=$MD5 size=$SZ"
+            if [ "$SZ" -ne 2747904 ]; then
+              echo "::warning::metadata 大小与上次构建(2747904)不同，代码或 Unity 版本可能已变更"
+            fi
+            if [ -n "$METADATA_MD5" ]; then
+              echo "导出阶段指纹: $METADATA_MD5"
+              if [ "$MD5" != "$METADATA_MD5" ]; then
+                echo "::error::打包后 metadata 指纹不一致 —— 打包环节损坏了文件"
+                FAIL=1
+              else
+                echo "OK: metadata 指纹一致"
+              fi
+            fi
+            # 结构复检（对解压后的副本再跑一次）
+            python3 "$GITHUB_WORKSPACE/.ci/check_metadata.py" "$META" || FAIL=1
+          fi
+
+          # 主程序 entitlements（TrollStore 安装时会自行重签，此处仅作记录）
+          echo "--- 主程序签名 ---"
+          if command -v codesign >/dev/null 2>&1; then
+            codesign -d --entitlements - "$APP/$APP_NAME" 2>&1 | head -20 || true
+          else
+            echo "(无 codesign，跳过)"
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo "::error::tipa 完整性校验失败"
+            exit 1
+          fi
+          echo "OK: tipa 完整性校验通过"
 
       - name: Upload tipa
         uses: actions/upload-artifact@v4
