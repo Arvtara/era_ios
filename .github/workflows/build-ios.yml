@@ -38,6 +38,8 @@ on:
   workflow_dispatch:
 
 env:
+  # 固定到 macos-15-intel 上较低的小版本（16.1），避开 16.4 新链接器
+  # 对 Unity 2019.4 老工程产生的畸形 LC_RPATH/LC_LOAD_DYLIB。
   XCODE_APP: /Applications/Xcode_16.1.app
   CACHE_SCOPE: mac-intel-u2019.4.40f1
   # 注意：GameCI 的 unity-builder 只识别标准版本号。
@@ -148,26 +150,22 @@ jobs:
           # runtime，GitHub runner 镜像只预装部分 runtime（2025-08 起最多 3 个），
           # 若选中没 runtime 的 Xcode 会报
           #   "LaunchScreen-iPhone.storyboard: error: iOS XX Platform Not Installed."
+          #
+          # 补充（重要）：不要选最新的 Xcode。Xcode 16 的新链接器会破坏
+          # Unity 2019.4 导出工程的 LC_RPATH/LC_LOAD_DYLIB 生成，产出
+          #   LC_LOAD_WEAK_DYLIB "path/Frameworks"（未展开的字面量）
+          # 且缺失 LC_RPATH，导致 dyld 启动失败、App 闪退。
+          # 因此在小版本相同的候选里，优先挑更低的（16.1 < 16.4）。
           XC_LIST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V)
           RUNTIMES=$(xcrun simctl list runtimes 2>/dev/null | grep -oiE 'iOS [0-9]+\.[0-9]+' | sort -u)
 
-          TARGET=""
-          if [ -n "$RUNTIMES" ]; then
-            for XC in $XC_LIST; do
-              XCV=$(echo "$XC" | grep -oE 'Xcode_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/Xcode_//')
-              MAJMIN=$(echo "$XCV" | cut -d. -f1,2)
-              if echo "$RUNTIMES" | grep -q "iOS $MAJMIN"; then
-                TARGET="$XC"
-                echo "✓ $XC 有匹配的 iOS runtime ($MAJMIN)"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$TARGET" ]; then
-            echo "::warning::没有 Xcode 与已装 iOS runtime 版本匹配，回退到 $XCODE_APP"
+          # 优先固定版本；只有它不存在时才回退到自动挑选。
+          if [ -d "$XCODE_APP" ]; then
             TARGET="$XCODE_APP"
-            [ -d "$TARGET" ] || TARGET=$(echo "$XC_LIST" | head -n 1)
+            echo "使用固定的 Xcode: $TARGET"
+          else
+            echo "::warning::$XCODE_APP 不存在，回退到自动挑选"
+            TARGET=$(echo "$XC_LIST" | head -n 1)
           fi
 
           echo "最终选用: $TARGET"
@@ -352,8 +350,52 @@ jobs:
             OTHER_LDFLAGS="-ld_classic" \
             OTHER_CFLAGS="" \
             GCC_PRECOMPILE_PREFIX_HEADER=NO \
+            LD_RUNPATH_SEARCH_PATHS="@executable_path/Frameworks @loader_path/Frameworks" \
             -derivedDataPath build \
             | tee build.log | tail -150
+
+      # ---- 关键校验：确认 dyld 能正确找到 UnityFramework ----
+      #
+      # 已实测的故障产物：主程序只带
+      #   LC_LOAD_WEAK_DYLIB "path/Frameworks"   <- 变量未展开的字面量
+      # 且完全没有 LC_RPATH，导致 dyld 启动即失败、App 闪退。
+      # 这里在打包前就把问题拦住，避免又出一个装不上的 tipa。
+      - name: Verify dyld load commands
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          BIN="$APP/$(basename "$APP" .app)"
+          echo "检查: $BIN"
+          otool -l "$BIN" > /tmp/lc.txt 2>&1 || true
+
+          echo "--- LC_RPATH ---"
+          grep -A2 "LC_RPATH" /tmp/lc.txt || echo "(无 LC_RPATH)"
+
+          echo "--- 依赖的 dylib ---"
+          otool -L "$BIN" | tail -n +2 || true
+
+          FAIL=0
+          if grep -qE '"/?path/Frameworks"|"path/Frameworks"' /tmp/lc.txt; then
+            echo "::error::检测到未展开的畸形路径 path/Frameworks，dyld 必然失败"
+            FAIL=1
+          fi
+          if ! grep -q "LC_RPATH" /tmp/lc.txt; then
+            echo "::error::主程序缺少 LC_RPATH，将无法定位 Frameworks 目录"
+            FAIL=1
+          fi
+          if ! otool -L "$BIN" | grep -q "UnityFramework"; then
+            echo "::warning::主程序未直接引用 UnityFramework（部分 Unity 模板为运行时 dlopen，可接受）"
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo "::error::加载命令校验失败，产物不可用，终止以免产出坏包"
+            exit 1
+          fi
+          echo "OK: 加载命令正常"
+
+          echo "--- UnityFramework 自身的 RPATH / ID ---"
+          FW="$APP/Frameworks/UnityFramework.framework/UnityFramework"
+          otool -D "$FW" 2>/dev/null || true
+          otool -l "$FW" 2>/dev/null | grep -A2 "LC_RPATH" || echo "(Framework 无 LC_RPATH，正常)"
 
       - name: Assemble Payload
         run: |
