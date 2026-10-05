@@ -46,6 +46,40 @@ namespace UEmueraBuilder
             Debug.Log("[TuanjieCloudBuild] outputDir   = " + outputDir);
             Debug.Log("[TuanjieCloudBuild] scenes      = " + EditorBuildSettings.scenes.Length);
 
+            // ------------------------------------------------------------------
+            // 强制设置 iOS 图形 API = Metal
+            //
+            // 【根因】本工程的 ProjectSettings.asset 里 m_BuildTargetGraphicsAPIs 是空数组。
+            // 空数组会让 Unity 在导出时走“兜底”分支，把渲染 API 列表填成
+            // OpenGLES2。反汇编 UnityFramework 里的 UnityGetRenderingAPIs 可确认：
+            //
+            //     ; 配置数量为 0 时的兜底分支
+            //     mov  w8, #0x2                 ; 2 = apiOpenGLES2
+            //     str  w8, [apis]               ; apis[0] = OpenGLES2
+            //     mov  w0, #0x1                 ; 返回数量 1
+            //
+            // 而 iOS 16 之后的 A 系列设备上 OpenGLES 早已不可用，EAGLContext
+            // 创建失败，于是 SelectRenderingAPIImpl() 遍历完所有候选后返回 0，
+            // 最终 _renderingAPI 保持 0，在 renderingAPI 断言处崩溃：
+            //
+            //     NSAssert(_renderingAPI != 0,
+            //         @"[UnityAppController renderingAPI] called before "
+            //          "[UnityAppController selectRenderingApi]");
+            //
+            // 实测崩溃栈（iPhone SE 3 / iOS 16.3）：
+            //     -[UnityAppController(Rendering) renderingAPI]
+            //     -[UnityAppController application:didFinishLaunchingWithOptions:]
+            //     _userInfoForFileAndLine  →  NSInternalInconsistencyException → abort()
+            //
+            // 注意 Unity 内部枚举与 GraphicsDeviceType 并不是同一套编号，
+            // 对应关系：apiOpenGLES2=2、apiOpenGLES3=3、apiMetal=4，
+            // 而 ProjectSettings 里序列化的是 0x08→GLES2 / 0x0b→GLES3 / 0x10→Metal。
+            // 所以这里不手写数值，直接调 API 让 Unity 自己转换。
+            // ------------------------------------------------------------------
+            ForceIOSMetalGraphicsAPI();
+
+            Debug.Log("[TuanjieCloudBuild] scenes      = " + EditorBuildSettings.scenes.Length);
+
             var scenes = EditorBuildSettings.scenes
                 .Where(s => s.enabled)
                 .Select(s => s.path)
@@ -123,6 +157,36 @@ namespace UEmueraBuilder
                     buildVersion, Application.unityVersion, summary.result, DateTime.Now));
 
             Debug.Log("[TuanjieCloudBuild] done -> " + exportPath);
+        }
+
+        /// <summary>
+        /// 把 iOS 平台的图形 API 强制设为 Metal（不启用"自动选择"）。
+        ///
+        /// 只调用 Unity 2019.4 就已存在的 API：
+        ///   PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget, bool)
+        ///   PlayerSettings.SetGraphicsAPIs(BuildTarget, GraphicsDeviceType[])
+        ///   PlayerSettings.GetGraphicsAPIs(BuildTarget)
+        /// </summary>
+        static void ForceIOSMetalGraphicsAPI()
+        {
+            try
+            {
+                PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.iOS, false);
+                PlayerSettings.SetGraphicsAPIs(
+                    BuildTarget.iOS,
+                    new[] { UnityEngine.Rendering.GraphicsDeviceType.Metal });
+
+                var apis = PlayerSettings.GetGraphicsAPIs(BuildTarget.iOS);
+                Debug.Log("[TuanjieCloudBuild] iOS GraphicsAPIs = " +
+                          (apis == null || apis.Length == 0
+                              ? "<空>"
+                              : string.Join(", ", apis.Select(a => a.ToString()))));
+            }
+            catch(Exception e)
+            {
+                // 设置失败不阻断构建：仍会在导出后用文本方式兜底修补 ProjectSettings.asset
+                Debug.LogWarning("[TuanjieCloudBuild] 设置 iOS GraphicsAPI 失败: " + e.Message);
+            }
         }
     }
 }
