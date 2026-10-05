@@ -153,40 +153,55 @@ namespace UEmueraBuilder
 
             File.WriteAllText(
                 Path.Combine(outputDir, "build-info.txt"),
-                string.Format("version={0}\nunity={1}\nresult={2}\ntime={3}\n",
-                    buildVersion, Application.unityVersion, summary.result, DateTime.Now));
+                string.Format(
+                    "version={0}\nunity={1}\nresult={2}\ntime={3}\nios_graphics_api={4}\n",
+                    buildVersion, Application.unityVersion, summary.result, DateTime.Now,
+                    string.Join("|", PlayerSettings.GetGraphicsAPIs(BuildTarget.iOS)
+                        .Select(a => a.ToString()))));
 
             Debug.Log("[TuanjieCloudBuild] done -> " + exportPath);
         }
 
         /// <summary>
-        /// 把 iOS 平台的图形 API 强制设为 Metal（不启用"自动选择"）。
+        /// 把 iOS 平台的图形 API 强制设为 Metal（不启用"自动选择"），并当场校验。
         ///
         /// 只调用 Unity 2019.4 就已存在的 API：
         ///   PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget, bool)
         ///   PlayerSettings.SetGraphicsAPIs(BuildTarget, GraphicsDeviceType[])
         ///   PlayerSettings.GetGraphicsAPIs(BuildTarget)
+        ///
+        /// 校验失败会直接抛异常中断构建——宁可构建失败，也不要打出一个
+        /// 一启动就 abort 的包（此前已经因此浪费了多次 30 分钟的云构建）。
         /// </summary>
         static void ForceIOSMetalGraphicsAPI()
         {
-            try
-            {
-                PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.iOS, false);
-                PlayerSettings.SetGraphicsAPIs(
-                    BuildTarget.iOS,
-                    new[] { UnityEngine.Rendering.GraphicsDeviceType.Metal });
+            PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.iOS, false);
+            PlayerSettings.SetGraphicsAPIs(
+                BuildTarget.iOS,
+                new[] { UnityEngine.Rendering.GraphicsDeviceType.Metal });
 
-                var apis = PlayerSettings.GetGraphicsAPIs(BuildTarget.iOS);
-                Debug.Log("[TuanjieCloudBuild] iOS GraphicsAPIs = " +
-                          (apis == null || apis.Length == 0
-                              ? "<空>"
-                              : string.Join(", ", apis.Select(a => a.ToString()))));
-            }
-            catch(Exception e)
+            var apis = PlayerSettings.GetGraphicsAPIs(BuildTarget.iOS);
+            var desc = (apis == null || apis.Length == 0)
+                ? "<空>"
+                : string.Join(", ", apis.Select(a => a.ToString()));
+
+            Debug.Log("[TuanjieCloudBuild] 校验 iOS GraphicsAPIs = " + desc);
+
+            if(apis == null || apis.Length == 0
+               || apis[0] != UnityEngine.Rendering.GraphicsDeviceType.Metal)
             {
-                // 设置失败不阻断构建：仍会在导出后用文本方式兜底修补 ProjectSettings.asset
-                Debug.LogWarning("[TuanjieCloudBuild] 设置 iOS GraphicsAPI 失败: " + e.Message);
+                throw new Exception(
+                    "[TuanjieCloudBuild] iOS 图形 API 设置失败，当前为: " + desc +
+                    "。若放任这样导出，Unity 会把候选渲染 API 兜底成 OpenGLES2，" +
+                    "在 iOS 16+ 的 A 系列设备上 EAGLContext 创建失败，最终 " +
+                    "_renderingAPI 保持 0，App 启动即触发 renderingAPI 断言崩溃。");
             }
+
+            Debug.Log("[TuanjieCloudBuild] iOS 图形 API 已确认为 Metal。");
+
+            // 把 PlayerSettings 的改动落盘，避免 BuildPlayer 内部重新读盘时
+            // 又拿到旧的空配置。
+            AssetDatabase.SaveAssets();
         }
     }
 }
