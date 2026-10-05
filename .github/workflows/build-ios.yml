@@ -13,13 +13,17 @@
 #   给 Unity Hub 传 --architecture arm64，而 Unity 2019.4 根本没有 arm64 版本，
 #   导致 "Missing [Unity] section in ini data" 安装失败。
 #   因此必须用 Intel 架构 runner：macos-15-intel（标准 runner，公开库免费）。
-#   Xcode 16 的新链接器编译老 Unity 库会报 duplicate symbols，
-#   通过 -ld_classic 切回旧链接器解决。
 #
-# 链接期已知问题（本文件已处理，勿回退）：
-#   Unity 2019.4 导出的工程同时带两套注册实现，
-#   RegisterMonoModules.cpp 与 UnityClassRegistration.mm /
-#   UnityICallRegistration.cpp 定义同名符号，必须删掉后者（步骤见 build job）。
+# iOS 脚本后端（致命配置，切勿删除）：
+#   ProjectSettings.asset 的 scriptingBackend 必须显式包含 iPhone: 1 (IL2CPP)。
+#   该字段是 Dictionary<BuildTargetGroup, ScriptingImplementation>，缺省项会
+#   回落到 Mono2x。历史上本工程漏配 iPhone 项，导致 Unity 导出时从未真正调用
+#   il2cpp.exe，却把上一次 IL2CPP 构建残留的 global-metadata.dat 一并打包；
+#   运行时 MetadataLoader::LoadMetadataFile() 能打开文件但解析不出头部，
+#   s_GlobalMetadataHeader 保持 NULL，最终在
+#     MetadataCache::Initialize() 的 ldr w0,[x8,#4] 处
+#   以 SIGSEGV at 0x4 崩溃（App 装上后图标一闪即退）。
+#   export job 内的 "Verify IL2CPP was actually used" 步骤负责兜底拦截。
 #
 # 性能说明：
 #   首次构建需下载 Unity 编辑器 2-3GB，耗时 40-70 分钟属正常。
@@ -54,6 +58,8 @@ jobs:
     name: Unity export Xcode project
     runs-on: macos-15-intel
     timeout-minutes: 180
+    outputs:
+      metadata_md5: ${{ steps.verify_il2cpp.outputs.metadata_md5 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,6 +123,78 @@ jobs:
           echo "导出目录: $DIR"
           du -sh "$DIR" || true
 
+      # ---- 致命校验：确认 iOS 真的走了 IL2CPP ----
+      #
+      # 背景（血泪教训）：ProjectSettings.asset 的 scriptingBackend 漏配 iPhone
+      # 项时，iOS 会静默回落到 Mono2x，Unity 导出阶段根本不执行 il2cpp.exe。
+      # 但工程目录里可能残留上一次 IL2CPP 构建产出的 global-metadata.dat，
+      # 于是打出一个"带着 IL2CPP 运行时 + 对不上的 metadata"的包：
+      # 装上图标一闪即退，崩溃栈定格在
+      #   il2cpp::vm::MetadataCache::Initialize()  ->  SIGSEGV at 0x4
+      # 这个错误在 Xcode 编译期完全看不出来，必须在这里拦。
+      - name: Verify IL2CPP was actually used
+        id: verify_il2cpp
+        run: |
+          DIR="$PROJ_DIR"
+          echo "检查导出目录: $DIR"
+          FAIL=0
+
+          # 1) IL2CPP 生成的代码目录必须存在且非空
+          NATIVE="$DIR/Classes/Native"
+          echo "--- Classes/Native ---"
+          if [ -d "$NATIVE" ]; then
+            COUNT=$(find "$NATIVE" -name "*.cpp" -o -name "*.mm" | wc -l | tr -d ' ')
+            echo "生成文件数: $COUNT"
+            ls "$NATIVE" | head -20 || true
+            if [ "$COUNT" -lt 1 ]; then
+              echo "::error::$NATIVE 为空 —— IL2CPP 未生成代码"
+              FAIL=1
+            fi
+          else
+            echo "::error::缺少 $NATIVE —— 未走 IL2CPP 后端"
+            FAIL=1
+          fi
+
+          # 2) global-metadata.dat 必须存在，并记录指纹供人工比对
+          META=$(find "$DIR" -name "global-metadata.dat" | head -n 1)
+          if [ -z "$META" ]; then
+            echo "::error::找不到 global-metadata.dat"
+            FAIL=1
+          else
+            echo "--- global-metadata.dat ---"
+            ls -l "$META"
+            MD5=$(md5 -q "$META" 2>/dev/null || md5sum "$META" | awk '{print $1}')
+            SIZE=$(stat -f%z "$META" 2>/dev/null || stat -c%s "$META")
+            echo "md5=$MD5 size=$SIZE"
+            [ -n "$GITHUB_ENV" ] && echo "METADATA_MD5=$MD5" >> "$GITHUB_ENV"
+            [ -n "$GITHUB_OUTPUT" ] && echo "metadata_md5=$MD5" >> "$GITHUB_OUTPUT"
+            # 头部校验：magic 必须为 0xFAB11BAF (小端存储 => 字节序 af 1b b1 fa)
+            # 用 od 而非 xxd，保证 macOS 与 Linux 上都有
+            MAGIC=$(od -An -tx1 -N4 "$META" | tr -d ' \n')
+            echo "magic(LE)=$MAGIC"
+            if [ "$MAGIC" != "af1bb1fa" ]; then
+              echo "::error::global-metadata.dat 头部 magic 异常($MAGIC)，文件可能损坏或为占位符"
+              FAIL=1
+            fi
+            if [ "$SIZE" -lt 100000 ]; then
+              echo "::error::global-metadata.dat 仅 $SIZE 字节，明显不是有效元数据"
+              FAIL=1
+            fi
+          fi
+
+          # 3) 导出日志里应能见到 il2cpp 的踪迹（有日志则顺带佐证，缺失不致命）
+          if [ -f "$DIR/../export.log" ]; then
+            echo "--- 导出日志中的 il2cpp 踪迹 ---"
+            grep -i "il2cpp" "$DIR/../export.log" | head -10 || echo "(日志中未见 il2cpp 字样)"
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo "::error::IL2CPP 校验未通过，产物必定在启动时崩溃，终止构建。"
+            echo "::error::请检查 ProjectSettings.asset 的 scriptingBackend 是否含 iPhone: 1"
+            exit 1
+          fi
+          echo "OK: IL2CPP 导出校验通过"
+
       - name: Upload Xcode project as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -131,6 +209,9 @@ jobs:
     needs: export
     runs-on: macos-15-intel
     timeout-minutes: 90
+    env:
+      # 从 export job 传过来的 metadata 指纹，用于在打包前比对产物是否混入旧文件
+      METADATA_MD5: ${{ needs.export.outputs.metadata_md5 }}
     steps:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
@@ -211,8 +292,6 @@ jobs:
           EOF
           cat ci/entitlements.plist
 
-      # -ld_classic：Xcode 15 新链接器对老 Unity 静态库会报 duplicate symbols，
-      #              切回旧链接器即可。Unity 2019.4 + Xcode 15 的标准解法。
       # Windows 推到 Git 的工程会丢失 Unix 执行位，
       # Unity 导出的 MapFileParser.sh 等脚本必须可执行，否则 Xcode
       # 会在 PhaseScriptExecution 阶段报 Permission denied。
@@ -242,98 +321,6 @@ jobs:
           echo "--- 检查残留 ---"
           grep -rn -- "-mno-thumb" Unity-iPhone.xcodeproj/ 2>/dev/null || echo "✓ 已无 -mno-thumb"
 
-      # ---- 关键修复：剔除重复的类注册源文件（必须两手都做）----
-      #
-      # Unity 2019.4 导出的工程里存在两套并存的 class/icall 注册实现：
-      #   Libraries/RegisterMonoModules.cpp   <- 2019.x 的正确实现，必须保留
-      #   Classes/Native/UnityClassRegistration.cpp
-      #   Classes/Native/UnityICallRegistration.cpp   <- 必须剔除
-      # 它们定义了相同的符号（RegisterAllClasses()、
-      # InvokeRegisterStaticallyLinkedModuleClasses()、
-      # _RegisterStaticallyLinkedModulesGranular、RegisterAllStrippedInternalCalls()），
-      # 同时编入 UnityFramework 会在链接期报 duplicate symbol。
-      #
-      # 踩坑记录：只改 pbxproj 删条目 → 文件仍在，仍被编译，重复符号照旧；
-      #           只删文件 → pbxproj 里 CompileC 条目仍在，Xcode 直接报
-      #             "Build input file cannot be found"。
-      #           必须两步都做：先从 pbxproj 摘掉编译条目，再删磁盘文件。
-      - name: Prepare pbxproj stripping script
-        run: |
-          cat > .ci_strip_registration.py <<'PYEOF'
-          import re, sys
-
-          pbx = sys.argv[1]
-          targets = ['UnityClassRegistration', 'UnityICallRegistration']
-
-          with open(pbx, encoding='utf-8', errors='surrogateescape') as fh:
-              lines = fh.read().split('\n')
-
-          # 1) 收集与目标文件相关的所有 24 位 UUID（PBXBuildFile / PBXFileReference 等）
-          uuids = set()
-          for ln in lines:
-              if any(t in ln for t in targets):
-                  uuids.update(re.findall(r'\b[0-9A-Fa-f]{24}\b', ln))
-
-          # 2) 整行删除：命中文件名、引用其 UUID、或仅剩分隔符的残留行
-          out, removed = [], 0
-          for ln in lines:
-              hit = any(t in ln for t in targets) or any(u in ln for u in uuids)
-              if not hit and re.match(r'^\s*[;,]\s*$', ln):
-                  hit = True
-              if hit:
-                  removed += 1
-              else:
-                  out.append(ln)
-
-          with open(pbx, 'w', encoding='utf-8', errors='surrogateescape') as fh:
-              fh.write('\n'.join(out))
-
-          print('pbxproj: 删除 %d 行, 关联 UUID %d 个' % (removed, len(uuids)))
-
-          # 3) 平衡性自检：花括号/圆括号数量必须仍然成对
-          txt = '\n'.join(out)
-          if txt.count('{') != txt.count('}') or txt.count('(') != txt.count(')'):
-              print('::error::pbxproj 结构可能已被破坏（括号不平衡）')
-              sys.exit(1)
-          print('OK: pbxproj 括号平衡')
-          PYEOF
-          echo "已生成 .ci_strip_registration.py"
-
-      - name: Remove duplicate class registration sources
-        run: |
-          PBX=Unity-iPhone.xcodeproj/project.pbxproj
-
-          echo "--- 移除前，pbxproj 中的相关条目 ---"
-          grep -nE "UnityClassRegistration|UnityICallRegistration" "$PBX" | head -30 || echo "(无)"
-
-          cp "$PBX" "$PBX.bak"
-          python3 .ci_strip_registration.py "$PBX"
-
-          echo "--- pbxproj 校验 ---"
-          if grep -qE "UnityClassRegistration|UnityICallRegistration" "$PBX"; then
-            echo "::warning::pbxproj 仍有残留引用"
-            grep -nE "UnityClassRegistration|UnityICallRegistration" "$PBX" | head -10 || true
-          else
-            echo "OK: pbxproj 已无相关引用"
-          fi
-
-          # 顺序很重要：先摘掉 pbxproj 条目，再删磁盘文件
-          echo "--- 删除源文件 ---"
-          for f in UnityClassRegistration.mm UnityClassRegistration.cpp \
-                   UnityICallRegistration.cpp UnityICallRegistration.mm; do
-            find . -type f -name "$f" -not -path "./build/*" -print -delete || true
-          done
-
-          echo "--- 最终校验 ---"
-          if find . -type f \( -name "UnityClassRegistration.*" -o -name "UnityICallRegistration.*" \) \
-               -not -path "./build/*" | grep -q .; then
-            echo "::warning::仍存在重复注册源文件"
-          else
-            echo "OK: 源文件已移除"
-          fi
-          echo "保留（必须存在）:"
-          find . -type f -name "RegisterMonoModules.*" -not -path "./build/*"
-
       - name: Build (no code signing)
         run: |
           set -o pipefail
@@ -347,9 +334,6 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            OTHER_LDFLAGS="-ld_classic" \
-            OTHER_CFLAGS="" \
-            GCC_PRECOMPILE_PREFIX_HEADER=NO \
             LD_RUNPATH_SEARCH_PATHS="@executable_path/Frameworks @loader_path/Frameworks" \
             -derivedDataPath build \
             | tee build.log | tail -150
@@ -396,6 +380,28 @@ jobs:
           FW="$APP/Frameworks/UnityFramework.framework/UnityFramework"
           otool -D "$FW" 2>/dev/null || true
           otool -l "$FW" 2>/dev/null | grep -A2 "LC_RPATH" || echo "(Framework 无 LC_RPATH，正常)"
+
+          # ---- 校验：打进 .app 的 metadata 必须与导出阶段生成的指纹一致 ----
+          # 若这里对不上，说明打包路径混入了旧的 global-metadata.dat，
+          # 运行时会在 MetadataCache::Initialize() 崩溃。
+          echo "--- global-metadata.dat 指纹 ---"
+          META_IN_APP="$APP/Data/Managed/Metadata/global-metadata.dat"
+          if [ ! -f "$META_IN_APP" ]; then
+            echo "::error::.app 中缺少 global-metadata.dat"
+            exit 1
+          fi
+          MD5_IN_APP=$(md5 -q "$META_IN_APP" 2>/dev/null || md5sum "$META_IN_APP" | awk '{print $1}')
+          echo "构建产物 md5 = $MD5_IN_APP"
+          if [ -n "$METADATA_MD5" ]; then
+            echo "导出阶段 md5 = $METADATA_MD5"
+            if [ "$MD5_IN_APP" != "$METADATA_MD5" ]; then
+              echo "::error::metadata 指纹不一致，产物可能混入旧文件"
+              exit 1
+            fi
+            echo "OK: metadata 指纹一致"
+          else
+            echo "::warning::未拿到导出阶段指纹（跨 job 传递限制），跳过比对"
+          fi
 
       - name: Assemble Payload
         run: |
