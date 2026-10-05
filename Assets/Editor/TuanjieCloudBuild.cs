@@ -51,8 +51,52 @@ namespace UEmueraBuilder
                 .Select(s => s.path)
                 .ToArray();
 
+            // 兜底：EditorBuildSettings.asset 里 m_Scenes 可能为空
+            // （本地手工加过场景但未提交该文件时会这样），
+            // 此时按约定自动查找 Assets/Main.unity。
             if(scenes.Length == 0)
-                throw new Exception("[TuanjieCloudBuild] 没有启用的场景，无法构建");
+            {
+                Debug.LogWarning("[TuanjieCloudBuild] EditorBuildSettings 场景列表为空，启用兜底查找。");
+
+                // 1) 约定路径优先
+                const string conventional = "Assets/Main.unity";
+                if(File.Exists(conventional))
+                {
+                    scenes = new[] { conventional };
+                    EditorBuildSettings.scenes = new[]
+                    {
+                        new EditorBuildSettingsScene(conventional, true)
+                    };
+                    Debug.Log("[TuanjieCloudBuild] 使用约定场景: " + conventional);
+                }
+                else
+                {
+                    // 2) 全盘扫描 .unity（排除 Package 缓存）
+                    var found = AssetDatabase.FindAssets("t:Scene")
+                        .Select(AssetDatabase.GUIDToAssetPath)
+                        .Where(p => !string.IsNullOrEmpty(p)
+                                    && p.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)
+                                    && !p.Contains("/Library/")
+                                    && !p.Contains("/PackageCache/"))
+                        .OrderBy(p => p)
+                        .ToArray();
+
+                    if(found.Length > 0)
+                    {
+                        scenes = found;
+                        EditorBuildSettings.scenes = found
+                            .Select(p => new EditorBuildSettingsScene(p, true))
+                            .ToArray();
+                        Debug.Log("[TuanjieCloudBuild] 扫描到 " + found.Length + " 个场景，已全部启用。");
+                        foreach(var s in found) Debug.Log("    " + s);
+                    }
+                }
+            }
+
+            if(scenes.Length == 0)
+                throw new Exception(
+                    "[TuanjieCloudBuild] 工程内找不到任何 .unity 场景文件，" +
+                    "请确认 Assets/Main.unity 已提交到仓库。");
 
             var options = new BuildPlayerOptions
             {
